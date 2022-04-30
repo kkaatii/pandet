@@ -7,20 +7,22 @@
 //! # async fn main() {
 //! use pandet::{PanicAlert, OnPanic};
 //!
-//! let alert = PanicAlert::new();
-//! let detector = alert.new_detector();
+//! let mut alert = PanicAlert::new();
 //!
 //! // Whichever async task spawner
 //! task::spawn(
 //!     async move {
 //!         panic!();
 //!     }
-//!     .on_panic(&detector) // 👈
+//!     .on_panic(&alert.new_detector()) // 👈
 //! );
 //!
+//! alert.drop_detector(); // See notes below
 //! assert!(alert.await.is_err());
 //! # }
 //! ```
+//! IMPORTANT NOTE: If no task panics, the alert will hang on indefinitely, so some sort of shutdown
+//! mechanism is needed. Check out [`PanicAlert::drop_detector()`] for details.
 //!
 //! For `!Send` tasks, there is the [`UnsendOnPanic`] trait:
 //! ```rust
@@ -28,8 +30,7 @@
 //! # fn main() {
 //! use pandet::{PanicAlert, UnsendOnPanic};
 //!
-//! let alert = PanicAlert::new();
-//! let detector = alert.new_detector();
+//! let mut alert = PanicAlert::new();
 //!
 //! # let local = task::LocalSet::new();
 //! # let rt = runtime::Runtime::new().unwrap();
@@ -38,9 +39,10 @@
 //!     async move {
 //!         panic!();
 //!     }
-//!     .unsend_on_panic(&detector)
+//!     .unsend_on_panic(&alert.new_detector())
 //! );
 //!
+//! alert.drop_detector();
 //! assert!(alert.await.is_err());
 //! # }); }
 //! ```
@@ -109,7 +111,9 @@ pub struct Panicked<Info = ()>(pub Info)
 where
     Info: Send + 'static;
 
-/// Detects panics for `PanicAlert`/`PanicMonitor`s.
+/// Notifies [`PanicAlert`]/[`PanicMonitor`] of panics.
+///
+/// Can be bounded to [`OnPanic`] and [`UnsendOnPanic`] types.
 pub struct PanicDetector<Info = ()>(UnboundedSender<PanicHook<Info>>)
 where
     Info: Send + 'static;
@@ -271,15 +275,16 @@ where
     }
 }
 
-/// A future that indicates whether a task has panicked.
+/// A future that finishes when a task has panicked.
 ///
 /// When one of the tasks that is being detected panics, the `PanicAlert`
-/// will finish with an `Err(Panicked)`.
+/// will finish with an `Err(Panicked)`, otherwise it will hang on indefinitely.
+/// Check out [`PanicAlert::drop_detector()`] for details.
 pub struct PanicAlert<Info = ()>
 where
     Info: Send + 'static,
 {
-    tx: UnboundedSender<PanicHook<Info>>,
+    tx: Option<UnboundedSender<PanicHook<Info>>>,
     rx: UnboundedReceiver<PanicHook<Info>>,
     list: FuturesUnordered<PanicHook<Info>>,
 }
@@ -292,7 +297,7 @@ where
     pub fn new() -> Self {
         let (tx, rx) = unbounded();
         PanicAlert {
-            tx,
+            tx: Some(tx),
             rx,
             list: FuturesUnordered::new(),
         }
@@ -300,7 +305,21 @@ where
 
     /// Creates a new `PanicDetector` that pairs with this `PanicAlert`.
     pub fn new_detector(&self) -> PanicDetector<Info> {
-        PanicDetector(self.tx.clone())
+        PanicDetector(self.tx.as_ref().expect("detector already dropped").clone())
+    }
+
+    /// Drops the original copy of this alert's detector so when there is no other detector instances,
+    /// the alert can finish automatically.
+    ///
+    /// As an alert does not know how many tasks are to be spawned, so it will not stop working
+    /// until:
+    /// 1. A panic occurs;
+    /// 2. Or there is no `PanicDetector` paired with it.
+    ///
+    /// Call this method will trigger the second scenario and when all the tasks bound to this
+    /// alert's detectors finish, it will finish as well.
+    pub fn drop_detector(&mut self) -> Option<PanicDetector<Info>> {
+        self.tx.take().map(|tx| PanicDetector(tx))
     }
 }
 
@@ -340,11 +359,13 @@ where
 }
 
 /// A [`Stream`](https://docs.rs/futures/latest/futures/stream/trait.Stream.html#) of detected panics.
+///
+/// Check out [`PanicMonitor::drop_detector()`] for details about when this stream will finish.
 pub struct PanicMonitor<Info = ()>
 where
     Info: Send + 'static,
 {
-    tx: UnboundedSender<PanicHook<Info>>,
+    tx: Option<UnboundedSender<PanicHook<Info>>>,
     rx: UnboundedReceiver<PanicHook<Info>>,
     list: FuturesUnordered<PanicHook<Info>>,
 }
@@ -357,7 +378,7 @@ where
     pub fn new() -> Self {
         let (tx, rx) = unbounded();
         PanicMonitor {
-            tx,
+            tx : Some(tx),
             rx,
             list: FuturesUnordered::new(),
         }
@@ -365,7 +386,21 @@ where
 
     /// Creates a new `PanicDetector` that pairs with this `PanicMonitor`.
     pub fn new_detector(&self) -> PanicDetector<Info> {
-        PanicDetector(self.tx.clone())
+        PanicDetector(self.tx.as_ref().expect("detector already dropped").clone())
+    }
+
+    /// Drops the original copy of this monitor's detector so when there is no other detector instances,
+    /// the monitor can finish automatically.
+    ///
+    /// As a monitor does not know how many tasks are to be spawned, so it will not stop working
+    /// until:
+    /// 1. The caller actively stops polling the stream;
+    /// 2. Or there is no `PanicDetector` paired with it.
+    ///
+    /// Call this method will trigger the second scenario and when all the tasks bound to this
+    /// monitor's detectors finish, it will finish as well.
+    pub fn drop_detector(&mut self) -> Option<PanicDetector<Info>> {
+        self.tx.take().map(|tx| PanicDetector(tx))
     }
 }
 
