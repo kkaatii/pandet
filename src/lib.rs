@@ -22,7 +22,7 @@
 //! # }
 //! ```
 //! IMPORTANT NOTE: If no task panics, the alert will hang on indefinitely, so some sort of shutdown
-//! mechanism is needed. Check out [`PanicAlert::drop_detector()`] for details.
+//! mechanism is needed. Check out [`PanicAlert::drop_detector`] for details.
 //!
 //! For `!Send` tasks, there is the [`UnsendOnPanic`] trait:
 //! ```rust
@@ -99,7 +99,6 @@ use futures::{
         mpsc::{unbounded, UnboundedReceiver, UnboundedSender},
         oneshot,
     },
-    stream::FuturesUnordered,
     FutureExt, Stream,
 };
 
@@ -152,7 +151,10 @@ where
         let (tx, rx) = oneshot::channel();
         detector
             .0
-            .unbounded_send(PanicHook { signaler: rx, info: Some(info) })
+            .unbounded_send(PanicHook {
+                signaler: rx,
+                info: Some(info),
+            })
             .expect("panic alert/monitor dropped early");
         UnsendPanicAwareFuture::new(async move {
             let ret = self.await;
@@ -221,7 +223,10 @@ where
         let (tx, rx) = oneshot::channel();
         detector
             .0
-            .unbounded_send(PanicHook { signaler: rx, info: Some(info) })
+            .unbounded_send(PanicHook {
+                signaler: rx,
+                info: Some(info),
+            })
             .expect("panic alert/monitor dropped early");
         PanicAwareFuture::new(async move {
             let ret = self.await;
@@ -279,14 +284,15 @@ where
 ///
 /// When one of the tasks that is being detected panics, the `PanicAlert`
 /// will finish with an `Err(Panicked)`, otherwise it will hang on indefinitely.
-/// Check out [`PanicAlert::drop_detector()`] for details.
+/// Check out [`PanicAlert::drop_detector`] for details.
 pub struct PanicAlert<Info = ()>
 where
     Info: Send + 'static,
 {
     tx: Option<UnboundedSender<PanicHook<Info>>>,
     rx: UnboundedReceiver<PanicHook<Info>>,
-    list: FuturesUnordered<PanicHook<Info>>,
+    next_hook: Option<PanicHook<Info>>,
+    rx_terminated: bool,
 }
 
 impl<Info> PanicAlert<Info>
@@ -299,7 +305,8 @@ where
         PanicAlert {
             tx: Some(tx),
             rx,
-            list: FuturesUnordered::new(),
+            next_hook: None,
+            rx_terminated: false,
         }
     }
 
@@ -316,8 +323,8 @@ where
     /// 1. A panic occurs;
     /// 2. Or there is no `PanicDetector` paired with it.
     ///
-    /// Call this method will trigger the second scenario and when all the tasks bound to this
-    /// alert's detectors finish, it will finish as well.
+    /// Call this method will trigger the second scenario and when all the tasks bound with this
+    /// alert's detectors finish, it will finish with an `Ok(())` as well.
     pub fn drop_detector(&mut self) -> Option<PanicDetector<Info>> {
         self.tx.take().map(|tx| PanicDetector(tx))
     }
@@ -330,44 +337,50 @@ where
     type Output = Result<(), Panicked<Info>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        let rx_terminated = match Pin::new(&mut self.rx).poll_next(cx) {
-            Poll::Pending => false,
-            Poll::Ready(Some(r)) => {
-                self.list.push(r);
-                false
+        Poll::Ready(loop {
+            if self.next_hook.is_none() && !self.rx_terminated {
+                self.rx_terminated = match Pin::new(&mut self.rx).poll_next(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Some(r)) => {
+                        self.next_hook = Some(r);
+                        false
+                    }
+                    Poll::Ready(None) => true,
+                };
             }
-            Poll::Ready(None) => true,
-        };
-        match Pin::new(&mut self.list).poll_next(cx) {
-            Poll::Ready(Some(r)) => {
-                if r.is_err() {
-                    Poll::Ready(r)
-                } else {
-                    Poll::Pending
+
+            if let Some(mut next) = self.next_hook.take() {
+                let res = Pin::new(&mut next).poll(cx);
+                match res {
+                    Poll::Ready(r) => {
+                        if r.is_err() {
+                            break r;
+                        }
+                    }
+                    Poll::Pending => {
+                        self.next_hook = Some(next);
+                        return Poll::Pending;
+                    }
                 }
+            } else {
+                break Ok(());
             }
-            Poll::Ready(None) => {
-                if rx_terminated {
-                    Poll::Ready(Ok(()))
-                } else {
-                    Poll::Pending
-                }
-            }
-            Poll::Pending => Poll::Pending,
-        }
+        })
     }
 }
 
 /// A [`Stream`](https://docs.rs/futures/latest/futures/stream/trait.Stream.html#) of detected panics.
 ///
-/// Check out [`PanicMonitor::drop_detector()`] for details about when this stream will finish.
+/// This stream emits `Some(Err(Panicked))` when a tasks panics, and nothing otherwise.
+/// Check out [`PanicMonitor::drop_detector`] for details about when this stream will finish.
 pub struct PanicMonitor<Info = ()>
 where
     Info: Send + 'static,
 {
     tx: Option<UnboundedSender<PanicHook<Info>>>,
     rx: UnboundedReceiver<PanicHook<Info>>,
-    list: FuturesUnordered<PanicHook<Info>>,
+    next_hook: Option<PanicHook<Info>>,
+    rx_terminated: bool,
 }
 
 impl<Info> PanicMonitor<Info>
@@ -378,9 +391,10 @@ where
     pub fn new() -> Self {
         let (tx, rx) = unbounded();
         PanicMonitor {
-            tx : Some(tx),
+            tx: Some(tx),
             rx,
-            list: FuturesUnordered::new(),
+            next_hook: None,
+            rx_terminated: false,
         }
     }
 
@@ -397,8 +411,8 @@ where
     /// 1. The caller actively stops polling the stream;
     /// 2. Or there is no `PanicDetector` paired with it.
     ///
-    /// Call this method will trigger the second scenario and when all the tasks bound to this
-    /// monitor's detectors finish, it will finish as well.
+    /// Call this method will trigger the second scenario and when all the tasks bound with this
+    /// monitor's detectors finish, it will finish with a `None` as well.
     pub fn drop_detector(&mut self) -> Option<PanicDetector<Info>> {
         self.tx.take().map(|tx| PanicDetector(tx))
     }
@@ -411,25 +425,35 @@ where
     type Item = Result<(), Panicked<Info>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let rx_terminated = match Pin::new(&mut self.rx).poll_next(cx) {
-            Poll::Pending => false,
-            Poll::Ready(Some(r)) => {
-                self.list.push(r);
-                false
+        Poll::Ready(loop {
+            if self.next_hook.is_none() && !self.rx_terminated {
+                self.rx_terminated = match Pin::new(&mut self.rx).poll_next(cx) {
+                    Poll::Pending => return Poll::Pending,
+                    Poll::Ready(Some(r)) => {
+                        self.next_hook = Some(r);
+                        false
+                    }
+                    Poll::Ready(None) => true,
+                };
             }
-            Poll::Ready(None) => true,
-        };
-        match Pin::new(&mut self.list).poll_next(cx) {
-            Poll::Ready(Some(r)) => Poll::Ready(Some(r)),
-            Poll::Ready(None) => {
-                if rx_terminated {
-                    Poll::Ready(None)
-                } else {
-                    Poll::Pending
+
+            if let Some(mut next) = self.next_hook.take() {
+                let res = Pin::new(&mut next).poll(cx);
+                match res {
+                    Poll::Ready(r) => {
+                        if r.is_err() {
+                            break Some(r);
+                        }
+                    }
+                    Poll::Pending => {
+                        self.next_hook = Some(next);
+                        return Poll::Pending;
+                    }
                 }
+            } else {
+                break None;
             }
-            Poll::Pending => Poll::Pending,
-        }
+        })
     }
 }
 
@@ -446,14 +470,22 @@ mod tests {
         let alert = PanicAlert::new();
         let detector = alert.new_detector();
 
-        tokio::spawn(
-            async move {
-                panic!();
-            }
-            .on_panic(&detector),
-        );
-
+        for i in 0..=10 {
+            tokio::spawn(
+                async move {
+                    if i == 1 {
+                        panic!("What could go wrong");
+                    }
+                }
+                .on_panic(&detector),
+            );
+        }
         assert!(alert.await.is_err());
+
+        let mut alert = PanicAlert::new();
+        tokio::spawn(async {}.on_panic(&alert.new_detector()));
+        alert.drop_detector();
+        assert!(alert.await.is_ok());
     }
 
     #[tokio::test]
@@ -479,24 +511,23 @@ mod tests {
     #[tokio::test]
     async fn monitor_works() {
         let mut monitor = PanicMonitor::new();
-        let detector = monitor.new_detector();
 
         for i in 0..=10 {
             tokio::spawn(
                 async move {
-                    if i == 10 {
+                    if i == 5 {
                         panic!();
                     }
                 }
-                .on_panic_info(&detector, 10),
+                .on_panic_info(&monitor.new_detector(), i),
             );
         }
 
+        monitor.drop_detector();
         while let Some(res) = monitor.next().await {
             if res.is_err() {
                 let id = res.unwrap_err().0;
-                assert_eq!(id, 10);
-                break;
+                assert_eq!(id, 5);
             }
         }
     }
