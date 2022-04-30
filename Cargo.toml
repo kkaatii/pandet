@@ -2,6 +2,11 @@
 name = "pandet"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
+description = "A lightweight library to help act on failure of detached async tasks"
+repository = "https://github.com/kkaatii/pandet/"
+readme = "README.md"
+keywords = ["async", "panic", "fail-fast"]
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
