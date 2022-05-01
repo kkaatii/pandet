@@ -1,4 +1,5 @@
-//! A lightweight library that helps you detect failure of spawned async tasks without having to `.await` their handles.
+//! A lightweight library that helps you detect failure of spawned async tasks without having to
+//! `.await` their handles.
 //! Useful when you are spawning lots of detached tasks but want to fast-fail if a panic occurs.
 //!
 //! ```rust
@@ -14,15 +15,17 @@
 //!     async move {
 //!         panic!();
 //!     }
-//!     .on_panic(&alert.new_detector()) // 👈
+//!     .on_panic(&alert.new_detector()) // 👈 Binds the alert's detector
 //! );
 //!
-//! alert.drop_detector(); // See notes below
-//! assert!(alert.await.is_err());
+//! assert!(alert.drop_detector().await.is_err()); // See notes below
 //! # }
 //! ```
-//! IMPORTANT NOTE: If no task panics, the alert will hang on indefinitely, so some sort of shutdown
-//! mechanism is needed. Check out [`PanicAlert::drop_detector`] for details.
+//! IMPORTANT NOTE: Directly `.await`ing an alert is possible, but in that case the alert as a
+//! future will only finish when a task panics. Calling `drop_detector()` allows it to finish with
+//! a `Ok(())` if no task panics as long as all the other `PanicDetector`s paired with the alert
+//! has gone out of scope. See [`PanicAlert::drop_detector`] and [`PanicMonitor::drop_detector`]
+//! for more details.
 //!
 //! For `!Send` tasks, there is the [`UnsendOnPanic`] trait:
 //! ```rust
@@ -42,8 +45,7 @@
 //!     .unsend_on_panic(&alert.new_detector())
 //! );
 //!
-//! alert.drop_detector();
-//! assert!(alert.await.is_err());
+//! assert!(alert.drop_detector().await.is_err());
 //! # }); }
 //! ```
 //!
@@ -63,21 +65,22 @@
 //! }
 //!
 //! let mut monitor = PanicMonitor::<PanicInfo>::new(); // Or simply PanicMonitor::new()
-//! let detector = monitor.new_detector();
-//!
-//! for task_id in 0..=10 {
-//!     task::spawn(
-//!         async move {
-//!             if task_id == 10 {
-//!                 panic!();
+//! {
+//!     let detector = monitor.new_detector();
+//!     for task_id in 0..=10 {
+//!         task::spawn(
+//!             async move {
+//!                 if task_id == 10 {
+//!                     panic!();
+//!                 }
 //!             }
-//!         }
-//!         // Informs the monitor of which task panicked
-//!         .on_panic_info(&detector, PanicInfo { task_id })
-//!     );
-//! }
+//!             // Informs the monitor of which task panicked
+//!             .on_panic_info(&detector, PanicInfo { task_id })
+//!         );
+//!     }
+//! } // detector goes out of scope, allowing the monitor to finish after calling drop_detector()
 //!
-//! while let Some(res) = monitor.next().await {
+//! while let Some(res) = monitor.drop_detector().next().await {
 //!     if let Err(e) = res {
 //!         let info = e.0;
 //!         assert_eq!(info.task_id, 10);
@@ -86,7 +89,6 @@
 //! }
 //! # }
 //! ```
-//!
 
 use std::{
     future::Future,
@@ -283,7 +285,8 @@ where
 /// A future that finishes when a task has panicked.
 ///
 /// When one of the tasks that is being detected panics, the `PanicAlert`
-/// will finish with an `Err(Panicked)`, otherwise it will hang on indefinitely.
+/// will finish with an `Err(Panicked)`, otherwise it will hang on indefinitely unless
+/// `drop_detector()` has been called and all `PanicDetector` instances have gone out of scope.
 /// Check out [`PanicAlert::drop_detector`] for details.
 pub struct PanicAlert<Info = ()>
 where
@@ -315,18 +318,51 @@ where
         PanicDetector(self.tx.as_ref().expect("detector already dropped").clone())
     }
 
-    /// Drops the original copy of this alert's detector so when there is no other detector instances,
-    /// the alert can finish automatically.
+    /// After calling this method, when there is no other detector instances paired with this alert,
+    /// it can finish automatically.
     ///
-    /// As an alert does not know how many tasks are to be spawned, so it will not stop working
+    /// As an alert does not know how many tasks are to be spawned, it will not stop working
     /// until:
     /// 1. A panic occurs;
-    /// 2. Or there is no `PanicDetector` paired with it.
+    /// 2. Or there is no `PanicDetector` paired with it and all tasks have finished.
     ///
-    /// Call this method will trigger the second scenario and when all the tasks bound with this
-    /// alert's detectors finish, it will finish with an `Ok(())` as well.
-    pub fn drop_detector(&mut self) -> Option<PanicDetector<Info>> {
-        self.tx.take().map(|tx| PanicDetector(tx))
+    /// Calling this method will allow the second scenario to happen by dropping the `PanicDetector`
+    /// instance contained within it, so when the outstanding detectors have gone out of scope,
+    /// this alert will be able to finish.
+    ///
+    /// # Example
+    ///
+    /// The below code will park indefinitely:
+    /// ```ignore
+    /// let alert = PanicAlert::new();
+    /// task::spawn(async {}.on_panic(&alert.new_detector()));
+    /// assert!(alert.await.is_ok());
+    /// ```
+    /// But this will not:
+    /// ```no_run
+    /// # use pandet::{OnPanic, PanicAlert};
+    /// # use tokio as task;
+    /// # task::runtime::Runtime::new().unwrap().block_on(async {
+    /// let mut alert = PanicAlert::new();
+    /// task::spawn(async {}.on_panic(&alert.new_detector()));
+    /// assert!(alert.drop_detector().await.is_ok());
+    /// # });
+    /// ```
+    /// Also be careful with `PanicDetector` instances:
+    /// ```no_run
+    /// # use pandet::{OnPanic, PanicAlert};
+    /// # use tokio as task;
+    /// # task::runtime::Runtime::new().unwrap().block_on(async {
+    /// let mut alert = PanicAlert::new();
+    /// let detector = alert.new_detector();
+    /// task::spawn(async {}.on_panic(&detector));
+    /// drop(detector); // Need to drop it
+    /// assert!(alert.drop_detector().await.is_ok());
+    /// # });
+    /// ```
+    pub fn drop_detector(&mut self) -> &mut Self {
+        self.tx = None;
+        self
     }
 }
 
@@ -403,18 +439,50 @@ where
         PanicDetector(self.tx.as_ref().expect("detector already dropped").clone())
     }
 
-    /// Drops the original copy of this monitor's detector so when there is no other detector instances,
-    /// the monitor can finish automatically.
+    /// After calling this method, when there is no other detector instances paired with this monitor,
+    /// it can finish automatically.
     ///
-    /// As a monitor does not know how many tasks are to be spawned, so it will not stop working
-    /// until:
-    /// 1. The caller actively stops polling the stream;
-    /// 2. Or there is no `PanicDetector` paired with it.
+    /// As a monitor does not know how many tasks are to be spawned, it will not stop working
+    /// until there is no `PanicDetector` paired with it and all tasks have finished.
     ///
-    /// Call this method will trigger the second scenario and when all the tasks bound with this
-    /// monitor's detectors finish, it will finish with a `None` as well.
-    pub fn drop_detector(&mut self) -> Option<PanicDetector<Info>> {
-        self.tx.take().map(|tx| PanicDetector(tx))
+    /// Calling this method will drop the `PanicDetector` instance contained within it, so when the
+    /// outstanding detectors have gone out of scope, this monitor will be able to finish.
+    ///
+    /// # Example
+    ///
+    /// The below code will park indefinitely:
+    /// ```ignore
+    /// let mut monitor = PanicMonitor::new();
+    /// task::spawn(async {}.on_panic(&monitor.new_detector()));
+    /// while let Some(_) = monitor.next().await {}
+    /// ```
+    /// But this will not:
+    /// ```no_run
+    /// # use pandet::{OnPanic, PanicMonitor};
+    /// # use tokio as task;
+    /// # use futures::StreamExt;
+    /// # task::runtime::Runtime::new().unwrap().block_on(async {
+    /// let mut monitor = PanicMonitor::new();
+    /// task::spawn(async {}.on_panic(&monitor.new_detector()));
+    /// while let Some(_) = monitor.drop_detector().next().await {}
+    /// # });
+    /// ```
+    /// Also be careful with `PanicDetector` instances:
+    /// ```no_run
+    /// # use pandet::{OnPanic, PanicMonitor};
+    /// # use tokio as task;
+    /// # use futures::StreamExt;
+    /// # task::runtime::Runtime::new().unwrap().block_on(async {
+    /// let mut monitor = PanicMonitor::new();
+    /// let detector = monitor.new_detector();
+    /// task::spawn(async {}.on_panic(&detector));
+    /// drop(detector); // Need to drop it
+    /// while let Some(_) = monitor.drop_detector().next().await {}
+    /// # });
+    /// ```
+    pub fn drop_detector(&mut self) -> &mut Self {
+        self.tx = None;
+        self
     }
 }
 
@@ -483,9 +551,11 @@ mod tests {
         assert!(alert.await.is_err());
 
         let mut alert = PanicAlert::new();
-        tokio::spawn(async {}.on_panic(&alert.new_detector()));
-        alert.drop_detector();
-        assert!(alert.await.is_ok());
+        (0..=10).for_each(|_| {
+            let detector = alert.new_detector();
+            tokio::spawn((move ||{async move {}.on_panic(&detector)})());
+        });
+        assert!(alert.drop_detector().await.is_ok());
     }
 
     #[tokio::test]
@@ -523,8 +593,7 @@ mod tests {
             );
         }
 
-        monitor.drop_detector();
-        while let Some(res) = monitor.next().await {
+        while let Some(res) = monitor.drop_detector().next().await {
             if res.is_err() {
                 let id = res.unwrap_err().0;
                 assert_eq!(id, 5);
