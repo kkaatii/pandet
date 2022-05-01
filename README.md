@@ -1,4 +1,6 @@
 # pandet
+[![version](https://img.shields.io/crates/v/pandet)](https://crates.io/crates/pandet) [![documentation](https://docs.rs/pandet/badge.svg)](https://docs.rs/pandet)  
+
 A lightweight library that helps you detect failure of spawned async tasks without having to `.await` their handles.
 Useful when you are spawning lots of detached tasks but want to fast-fail if a panic occurs.
 
@@ -6,14 +8,13 @@ Useful when you are spawning lots of detached tasks but want to fast-fail if a p
 use pandet::{PanicAlert, OnPanic};
 
 let alert = PanicAlert::new();
-let detector = alert.new_detector();
 
 // Whichever async task spawner
 task::spawn(
     async move {
         panic!();
     }
-    .on_panic(&detector) // 👈
+    .on_panic(&alert.new_detector()) // 👈
 );
 
 assert!(alert.await.is_err());
