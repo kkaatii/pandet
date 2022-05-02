@@ -18,13 +18,8 @@ task::spawn(
     .on_panic(&alert.new_detector()) // 👈 Binds the alert's detector
 );
 
-assert!(alert.drop_detector().await.is_err());  // See notes below
+assert!(alert.drop_detector().await.is_err());
 ```
-IMPORTANT NOTE: Directly `.await`ing an alert is possible, but in this case the alert as a
-future will only finish when a task panics. Calling `drop_detector()` allows it to finish with
-a `Ok(())` if no task panics as long as all the other `PanicDetector`s paired with the alert
-has gone out of scope. See [`PanicAlert::drop_detector`] and [`PanicMonitor::drop_detector`]
-for more details.
 
 For `!Send` tasks, there is the `UnsendOnPanic` trait:
 ```rust
