@@ -70,7 +70,7 @@
 //!     for task_id in 0..=10 {
 //!         task::spawn(
 //!             async move {
-//!                 if task_id == 10 {
+//!                 if task_id % 3 == 0 {
 //!                     panic!();
 //!                 }
 //!             }
@@ -81,11 +81,8 @@
 //! } // detector goes out of scope, allowing the monitor to finish after calling drop_detector()
 //!
 //! while let Some(res) = monitor.drop_detector().next().await {
-//!     if let Err(e) = res {
-//!         let info = e.0;
-//!         assert_eq!(info.task_id, 10);
-//!         break;
-//!     }
+//!     let info = res.unwrap_err().0;
+//!     assert_eq!(info.task_id % 3, 0);
 //! }
 //! # }
 //! ```
@@ -282,7 +279,7 @@ where
     }
 }
 
-/// A future that finishes when a task has panicked.
+/// A future that finishes with an `Err(Panicked<Info>)` when a task has panicked.
 ///
 /// When one of the tasks that is being detected panics, the `PanicAlert`
 /// will finish with an `Err(Panicked)`, otherwise it will hang on indefinitely unless
@@ -295,7 +292,6 @@ where
     tx: Option<UnboundedSender<PanicHook<Info>>>,
     rx: UnboundedReceiver<PanicHook<Info>>,
     next_hook: Option<PanicHook<Info>>,
-    rx_terminated: bool,
 }
 
 impl<Info> PanicAlert<Info>
@@ -309,7 +305,6 @@ where
             tx: Some(tx),
             rx,
             next_hook: None,
-            rx_terminated: false,
         }
     }
 
@@ -374,14 +369,11 @@ where
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         Poll::Ready(loop {
-            if self.next_hook.is_none() && !self.rx_terminated {
-                self.rx_terminated = match Pin::new(&mut self.rx).poll_next(cx) {
+            if self.next_hook.is_none() {
+                match Pin::new(&mut self.rx).poll_next(cx) {
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Some(r)) => {
-                        self.next_hook = Some(r);
-                        false
-                    }
-                    Poll::Ready(None) => true,
+                    Poll::Ready(Some(r)) => self.next_hook = Some(r),
+                    Poll::Ready(None) => break Ok(()),
                 };
             }
 
@@ -398,8 +390,6 @@ where
                         return Poll::Pending;
                     }
                 }
-            } else {
-                break Ok(());
             }
         })
     }
@@ -407,7 +397,7 @@ where
 
 /// A [`Stream`](https://docs.rs/futures/latest/futures/stream/trait.Stream.html#) of detected panics.
 ///
-/// This stream emits `Some(Err(Panicked))` when a tasks panics, and nothing otherwise.
+/// This stream emits `Err(Panicked<Info>)` when tasks panic, and nothing otherwise.
 /// Check out [`PanicMonitor::drop_detector`] for details about when this stream will finish.
 pub struct PanicMonitor<Info = ()>
 where
@@ -416,7 +406,6 @@ where
     tx: Option<UnboundedSender<PanicHook<Info>>>,
     rx: UnboundedReceiver<PanicHook<Info>>,
     next_hook: Option<PanicHook<Info>>,
-    rx_terminated: bool,
 }
 
 impl<Info> PanicMonitor<Info>
@@ -430,7 +419,6 @@ where
             tx: Some(tx),
             rx,
             next_hook: None,
-            rx_terminated: false,
         }
     }
 
@@ -494,14 +482,11 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         Poll::Ready(loop {
-            if self.next_hook.is_none() && !self.rx_terminated {
-                self.rx_terminated = match Pin::new(&mut self.rx).poll_next(cx) {
+            if self.next_hook.is_none() {
+                match Pin::new(&mut self.rx).poll_next(cx) {
                     Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Some(r)) => {
-                        self.next_hook = Some(r);
-                        false
-                    }
-                    Poll::Ready(None) => true,
+                    Poll::Ready(Some(r)) => self.next_hook = Some(r),
+                    Poll::Ready(None) => break None,
                 };
             }
 
@@ -518,8 +503,6 @@ where
                         return Poll::Pending;
                     }
                 }
-            } else {
-                break None;
             }
         })
     }
@@ -553,29 +536,30 @@ mod tests {
         let mut alert = PanicAlert::new();
         (0..=10).for_each(|_| {
             let detector = alert.new_detector();
-            tokio::spawn((move ||{async move {}.on_panic(&detector)})());
+            tokio::spawn((move || async move {}.on_panic(&detector))());
         });
         assert!(alert.drop_detector().await.is_ok());
     }
 
     #[tokio::test]
     async fn unsend_works() {
-        let alert = PanicAlert::new();
-        let detector = alert.new_detector();
+        let mut alert = PanicAlert::new();
 
         let local = tokio::task::LocalSet::new();
         local
             .run_until(async {
-                let _ = tokio::task::spawn_local(
-                    async move {
-                        panic!();
-                    }
-                    .unsend_on_panic(&detector),
-                )
-                .await;
+                {
+                    let detector = alert.new_detector();
+                    let _ = tokio::task::spawn_local(
+                        async move {
+                            // panic!();
+                        }
+                        .unsend_on_panic(&detector),
+                    );
+                }
+                assert!(alert.drop_detector().await.is_ok());
             })
             .await;
-        assert!(alert.await.is_err());
     }
 
     #[tokio::test]
@@ -585,7 +569,7 @@ mod tests {
         for i in 0..=10 {
             tokio::spawn(
                 async move {
-                    if i == 5 {
+                    if i % 5 == 0 {
                         panic!();
                     }
                 }
@@ -594,10 +578,8 @@ mod tests {
         }
 
         while let Some(res) = monitor.drop_detector().next().await {
-            if res.is_err() {
-                let id = res.unwrap_err().0;
-                assert_eq!(id, 5);
-            }
+            let id = res.unwrap_err().0;
+            assert_eq!(id % 5, 0);
         }
     }
 }

@@ -55,7 +55,7 @@ let mut monitor = PanicMonitor::<PanicInfo>::new(); // Or simply PanicMonitor::n
     for task_id in 0..=10 {
         task::spawn(
             async move {
-                if task_id == 10 {
+                if task_id % 3 == 0 {
                     panic!();
                 }
             }
@@ -66,10 +66,7 @@ let mut monitor = PanicMonitor::<PanicInfo>::new(); // Or simply PanicMonitor::n
 } // detector goes out of scope, allowing the monitor to finish after calling drop_detector()
 
 while let Some(res) = monitor.drop_detector().next().await {
-    if let Err(e) = res {
-        let info = e.0;
-        assert_eq!(info.task_id, 10);
-        break;
-    }
+    let info = res.unwrap_err().0;
+    assert_eq!(info.task_id % 3, 0);
 }
 ```
