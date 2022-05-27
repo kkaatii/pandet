@@ -93,6 +93,7 @@ use std::{
     task::{Context, Poll},
 };
 
+use futures::stream::FuturesUnordered;
 use futures::{
     channel::{
         mpsc::{unbounded, UnboundedReceiver, UnboundedSender},
@@ -291,7 +292,8 @@ where
 {
     tx: Option<UnboundedSender<PanicHook<Info>>>,
     rx: UnboundedReceiver<PanicHook<Info>>,
-    next_hook: Option<PanicHook<Info>>,
+    hooks: FuturesUnordered<PanicHook<Info>>,
+    rx_closed: bool,
 }
 
 impl<Info> PanicAlert<Info>
@@ -304,7 +306,8 @@ where
         PanicAlert {
             tx: Some(tx),
             rx,
-            next_hook: None,
+            hooks: FuturesUnordered::new(),
+            rx_closed: false,
         }
     }
 
@@ -368,30 +371,37 @@ where
     type Output = Result<(), Panicked<Info>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-        Poll::Ready(loop {
-            if self.next_hook.is_none() {
-                match Pin::new(&mut self.rx).poll_next(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Some(r)) => self.next_hook = Some(r),
-                    Poll::Ready(None) => break Ok(()),
-                };
-            }
-
-            if let Some(mut next) = self.next_hook.take() {
-                let res = Pin::new(&mut next).poll(cx);
-                match res {
-                    Poll::Ready(r) => {
-                        if r.is_err() {
-                            break r;
-                        }
-                    }
-                    Poll::Pending => {
-                        self.next_hook = Some(next);
-                        return Poll::Pending;
-                    }
+        while !self.rx_closed {
+            match Pin::new(&mut self.rx).poll_next(cx) {
+                Poll::Pending => break,
+                Poll::Ready(Some(r)) => self.hooks.push(r),
+                Poll::Ready(None) => {
+                    self.rx_closed = true;
+                    break;
                 }
             }
-        })
+        }
+
+        loop {
+            let res = Pin::new(&mut self.hooks).poll_next(cx);
+            match res {
+                Poll::Ready(Some(r)) => {
+                    if r.is_err() {
+                        break Poll::Ready(r);
+                    }
+                }
+                Poll::Ready(None) => {
+                    if self.rx_closed {
+                        break Poll::Ready(Ok(()));
+                    } else {
+                        break Poll::Pending;
+                    }
+                }
+                Poll::Pending => {
+                    break Poll::Pending;
+                }
+            }
+        }
     }
 }
 
@@ -405,7 +415,8 @@ where
 {
     tx: Option<UnboundedSender<PanicHook<Info>>>,
     rx: UnboundedReceiver<PanicHook<Info>>,
-    next_hook: Option<PanicHook<Info>>,
+    hooks: FuturesUnordered<PanicHook<Info>>,
+    rx_closed: bool,
 }
 
 impl<Info> PanicMonitor<Info>
@@ -418,7 +429,8 @@ where
         PanicMonitor {
             tx: Some(tx),
             rx,
-            next_hook: None,
+            hooks: FuturesUnordered::new(),
+            rx_closed: false,
         }
     }
 
@@ -481,30 +493,37 @@ where
     type Item = Result<(), Panicked<Info>>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        Poll::Ready(loop {
-            if self.next_hook.is_none() {
-                match Pin::new(&mut self.rx).poll_next(cx) {
-                    Poll::Pending => return Poll::Pending,
-                    Poll::Ready(Some(r)) => self.next_hook = Some(r),
-                    Poll::Ready(None) => break None,
-                };
-            }
-
-            if let Some(mut next) = self.next_hook.take() {
-                let res = Pin::new(&mut next).poll(cx);
-                match res {
-                    Poll::Ready(r) => {
-                        if r.is_err() {
-                            break Some(r);
-                        }
-                    }
-                    Poll::Pending => {
-                        self.next_hook = Some(next);
-                        return Poll::Pending;
-                    }
+        while !self.rx_closed {
+            match Pin::new(&mut self.rx).poll_next(cx) {
+                Poll::Pending => break,
+                Poll::Ready(Some(r)) => self.hooks.push(r),
+                Poll::Ready(None) => {
+                    self.rx_closed = true;
+                    break;
                 }
             }
-        })
+        }
+
+        loop {
+            let res = Pin::new(&mut self.hooks).poll_next(cx);
+            match res {
+                Poll::Ready(Some(r)) => {
+                    if r.is_err() {
+                        break Poll::Ready(Some(r));
+                    }
+                }
+                Poll::Ready(None) => {
+                    if self.rx_closed {
+                        break Poll::Ready(None);
+                    } else {
+                        break Poll::Pending;
+                    }
+                }
+                Poll::Pending => {
+                    break Poll::Pending;
+                }
+            }
+        }
     }
 }
 
