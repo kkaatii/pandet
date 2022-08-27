@@ -8,24 +8,20 @@
 //! # async fn main() {
 //! use pandet::{PanicAlert, OnPanic};
 //!
-//! let mut alert = PanicAlert::new();
+//! let (alert, detector) = PanicAlert::new();
 //!
 //! // Whichever async task spawner
 //! task::spawn(
 //!     async move {
 //!         panic!();
 //!     }
-//!     .on_panic(&alert.new_detector()) // 👈 Binds the alert's detector
+//!     .on_panic(&detector) // 👈 Binds the alert's detector
 //! );
 //!
-//! assert!(alert.drop_detector().await.is_err()); // See notes below
+//! drop(detector);
+//! assert!(alert.await.is_some()); // See notes below
 //! # }
 //! ```
-//! IMPORTANT NOTE: Directly `.await`ing an alert is possible, but in that case the alert as a
-//! future will only finish when a task panics. Calling `drop_detector()` allows it to finish with
-//! a `Ok(())` if no task panics as long as all the other `PanicDetector`s paired with the alert
-//! has gone out of scope. See [`PanicAlert::drop_detector`] and [`PanicMonitor::drop_detector`]
-//! for more details.
 //!
 //! For `!Send` tasks, there is the [`UnsendOnPanic`] trait:
 //! ```rust
@@ -33,7 +29,7 @@
 //! # fn main() {
 //! use pandet::{PanicAlert, UnsendOnPanic};
 //!
-//! let mut alert = PanicAlert::new();
+//! let (alert, detector) = PanicAlert::new();
 //!
 //! # let local = task::LocalSet::new();
 //! # let rt = runtime::Runtime::new().unwrap();
@@ -42,10 +38,11 @@
 //!     async move {
 //!         panic!();
 //!     }
-//!     .unsend_on_panic(&alert.new_detector())
+//!     .unsend_on_panic(&detector)
 //! );
 //!
-//! assert!(alert.drop_detector().await.is_err());
+//! drop(detector);
+//! assert!(alert.await.is_some());
 //! # }); }
 //! ```
 //!
@@ -64,24 +61,22 @@
 //!     task_id: usize,
 //! }
 //!
-//! let mut monitor = PanicMonitor::<PanicInfo>::new(); // Or simply PanicMonitor::new()
-//! {
-//!     let detector = monitor.new_detector();
-//!     for task_id in 0..=10 {
-//!         task::spawn(
-//!             async move {
-//!                 if task_id % 3 == 0 {
-//!                     panic!();
-//!                 }
+//! let (mut monitor, detector) = PanicMonitor::<PanicInfo>::new(); // Or simply PanicMonitor::new()
+//! for task_id in 0..=10 {
+//!     task::spawn(
+//!         async move {
+//!             if task_id % 3 == 0 {
+//!                 panic!();
 //!             }
-//!             // Informs the monitor of which task panicked
-//!             .on_panic_info(&detector, PanicInfo { task_id })
-//!         );
-//!     }
-//! } // detector goes out of scope, allowing the monitor to finish after calling drop_detector()
+//!         }
+//!         // Informs the monitor of which task panicked
+//!         .on_panic_info(&detector, PanicInfo { task_id })
+//!     );
+//! }
 //!
-//! while let Some(res) = monitor.drop_detector().next().await {
-//!     let info = res.unwrap_err().0;
+//! drop(detector);
+//! while let Some(res) = monitor.next().await {
+//!     let info = res.0;
 //!     assert_eq!(info.task_id % 3, 0);
 //! }
 //! # }
@@ -102,10 +97,10 @@ use futures::{
     FutureExt, Stream,
 };
 
-/// An error type that is returned by the panic alert/monitor when a panic occurs.
+/// Created by the panic detector when a panic occurs.
 ///
 /// Its first and only field is the additional information emitted when the corresponding task panics.
-/// It defaults to `()`.
+/// The field defaults to `()`.
 pub struct Panicked<Info = ()>(pub Info)
 where
     Info: Send + 'static;
@@ -116,6 +111,15 @@ where
 pub struct PanicDetector<Info = ()>(UnboundedSender<PanicHook<Info>>)
 where
     Info: Send + 'static;
+
+impl<Info> Clone for PanicDetector<Info>
+where
+    Info: Send + 'static,
+{
+    fn clone(&self) -> Self {
+        Self(self.0.clone())
+    }
+}
 
 /// Used to bind a `PanicDetector` onto any task. Implemented for all `Future` types.
 pub trait UnsendOnPanic<'a, T> {
@@ -158,7 +162,7 @@ where
             .expect("panic alert/monitor dropped early");
         UnsendPanicAwareFuture::new(async move {
             let ret = self.await;
-            tx.send(()).expect("panic alert/monitor dropped early");
+            let _ = tx.send(());
             ret
         })
     }
@@ -230,7 +234,7 @@ where
             .expect("panic alert/monitor dropped early");
         PanicAwareFuture::new(async move {
             let ret = self.await;
-            tx.send(()).expect("panic alert/monitor dropped early");
+            let _ = tx.send(());
             ret
         })
     }
@@ -272,25 +276,27 @@ impl<Info> Future for PanicHook<Info>
 where
     Info: Unpin + Send + 'static,
 {
-    type Output = Result<(), Panicked<Info>>;
+    type Output = Option<Panicked<Info>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let res = self.signaler.poll_unpin(cx);
-        res.map_err(|_| Panicked(self.info.take().expect("panic info already emitted")))
+        res.map(|r| {
+            if r.is_err() {
+                Some(Panicked(
+                    self.info.take().expect("panic info already emitted"),
+                ))
+            } else {
+                None
+            }
+        })
     }
 }
 
-/// A future that finishes with an `Err(Panicked<Info>)` when a task has panicked.
-///
-/// When one of the tasks that is being detected panics, the `PanicAlert`
-/// will finish with an `Err(Panicked)`, otherwise it will hang on indefinitely unless
-/// `drop_detector()` has been called and all `PanicDetector` instances have gone out of scope.
-/// Check out [`PanicAlert::drop_detector`] for details.
+/// A future that finishes with an `Some(Panicked<Info>)` when a task has panicked or `None` if no task panicked.
 pub struct PanicAlert<Info = ()>
 where
     Info: Send + 'static,
 {
-    tx: Option<UnboundedSender<PanicHook<Info>>>,
     rx: UnboundedReceiver<PanicHook<Info>>,
     hooks: FuturesUnordered<PanicHook<Info>>,
     rx_closed: bool,
@@ -301,66 +307,16 @@ where
     Info: Send + 'static,
 {
     /// Creates a new `PanicMonitor`.
-    pub fn new() -> Self {
+    pub fn new() -> (Self, PanicDetector<Info>) {
         let (tx, rx) = unbounded();
-        PanicAlert {
-            tx: Some(tx),
-            rx,
-            hooks: FuturesUnordered::new(),
-            rx_closed: false,
-        }
-    }
-
-    /// Creates a new `PanicDetector` that pairs with this `PanicAlert`.
-    pub fn new_detector(&self) -> PanicDetector<Info> {
-        PanicDetector(self.tx.as_ref().expect("detector already dropped").clone())
-    }
-
-    /// After calling this method, when there is no other detector instances paired with this alert,
-    /// it can finish automatically.
-    ///
-    /// As an alert does not know how many tasks are to be spawned, it will not stop working
-    /// until:
-    /// 1. A panic occurs;
-    /// 2. Or there is no `PanicDetector` paired with it and all tasks have finished.
-    ///
-    /// Calling this method will allow the second scenario to happen by dropping the `PanicDetector`
-    /// instance contained within it, so when the outstanding detectors have gone out of scope,
-    /// this alert will be able to finish.
-    ///
-    /// # Example
-    ///
-    /// The below code will park indefinitely:
-    /// ```ignore
-    /// let alert = PanicAlert::new();
-    /// task::spawn(async {}.on_panic(&alert.new_detector()));
-    /// assert!(alert.await.is_ok());
-    /// ```
-    /// But this will not:
-    /// ```no_run
-    /// # use pandet::{OnPanic, PanicAlert};
-    /// # use tokio as task;
-    /// # task::runtime::Runtime::new().unwrap().block_on(async {
-    /// let mut alert = PanicAlert::new();
-    /// task::spawn(async {}.on_panic(&alert.new_detector()));
-    /// assert!(alert.drop_detector().await.is_ok());
-    /// # });
-    /// ```
-    /// Also be careful with `PanicDetector` instances:
-    /// ```no_run
-    /// # use pandet::{OnPanic, PanicAlert};
-    /// # use tokio as task;
-    /// # task::runtime::Runtime::new().unwrap().block_on(async {
-    /// let mut alert = PanicAlert::new();
-    /// let detector = alert.new_detector();
-    /// task::spawn(async {}.on_panic(&detector));
-    /// drop(detector); // Need to drop it
-    /// assert!(alert.drop_detector().await.is_ok());
-    /// # });
-    /// ```
-    pub fn drop_detector(&mut self) -> &mut Self {
-        self.tx = None;
-        self
+        (
+            PanicAlert {
+                rx,
+                hooks: FuturesUnordered::new(),
+                rx_closed: false,
+            },
+            PanicDetector(tx),
+        )
     }
 }
 
@@ -368,7 +324,7 @@ impl<Info> Future for PanicAlert<Info>
 where
     Info: Unpin + Send + 'static,
 {
-    type Output = Result<(), Panicked<Info>>;
+    type Output = Option<Panicked<Info>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         while !self.rx_closed {
@@ -386,13 +342,13 @@ where
             let res = Pin::new(&mut self.hooks).poll_next(cx);
             match res {
                 Poll::Ready(Some(r)) => {
-                    if r.is_err() {
+                    if r.is_some() {
                         break Poll::Ready(r);
                     }
                 }
                 Poll::Ready(None) => {
                     if self.rx_closed {
-                        break Poll::Ready(Ok(()));
+                        break Poll::Ready(None);
                     } else {
                         break Poll::Pending;
                     }
@@ -406,14 +362,12 @@ where
 }
 
 /// A [`Stream`](https://docs.rs/futures/latest/futures/stream/trait.Stream.html#) of detected panics.
-///
-/// This stream emits `Err(Panicked<Info>)` when tasks panic, and nothing otherwise.
-/// Check out [`PanicMonitor::drop_detector`] for details about when this stream will finish.
+/// 
+/// It finishes when all the futures that it's detecting for have finished.
 pub struct PanicMonitor<Info = ()>
 where
     Info: Send + 'static,
 {
-    tx: Option<UnboundedSender<PanicHook<Info>>>,
     rx: UnboundedReceiver<PanicHook<Info>>,
     hooks: FuturesUnordered<PanicHook<Info>>,
     rx_closed: bool,
@@ -424,65 +378,16 @@ where
     Info: Send + 'static,
 {
     /// Creates a new `PanicMonitor`.
-    pub fn new() -> Self {
+    pub fn new() -> (Self, PanicDetector<Info>) {
         let (tx, rx) = unbounded();
-        PanicMonitor {
-            tx: Some(tx),
-            rx,
-            hooks: FuturesUnordered::new(),
-            rx_closed: false,
-        }
-    }
-
-    /// Creates a new `PanicDetector` that pairs with this `PanicMonitor`.
-    pub fn new_detector(&self) -> PanicDetector<Info> {
-        PanicDetector(self.tx.as_ref().expect("detector already dropped").clone())
-    }
-
-    /// After calling this method, when there is no other detector instances paired with this monitor,
-    /// it can finish automatically.
-    ///
-    /// As a monitor does not know how many tasks are to be spawned, it will not stop working
-    /// until there is no `PanicDetector` paired with it and all tasks have finished.
-    ///
-    /// Calling this method will drop the `PanicDetector` instance contained within it, so when the
-    /// outstanding detectors have gone out of scope, this monitor will be able to finish.
-    ///
-    /// # Example
-    ///
-    /// The below code will park indefinitely:
-    /// ```ignore
-    /// let mut monitor = PanicMonitor::new();
-    /// task::spawn(async {}.on_panic(&monitor.new_detector()));
-    /// while let Some(_) = monitor.next().await {}
-    /// ```
-    /// But this will not:
-    /// ```no_run
-    /// # use pandet::{OnPanic, PanicMonitor};
-    /// # use tokio as task;
-    /// # use futures::StreamExt;
-    /// # task::runtime::Runtime::new().unwrap().block_on(async {
-    /// let mut monitor = PanicMonitor::new();
-    /// task::spawn(async {}.on_panic(&monitor.new_detector()));
-    /// while let Some(_) = monitor.drop_detector().next().await {}
-    /// # });
-    /// ```
-    /// Also be careful with `PanicDetector` instances:
-    /// ```no_run
-    /// # use pandet::{OnPanic, PanicMonitor};
-    /// # use tokio as task;
-    /// # use futures::StreamExt;
-    /// # task::runtime::Runtime::new().unwrap().block_on(async {
-    /// let mut monitor = PanicMonitor::new();
-    /// let detector = monitor.new_detector();
-    /// task::spawn(async {}.on_panic(&detector));
-    /// drop(detector); // Need to drop it
-    /// while let Some(_) = monitor.drop_detector().next().await {}
-    /// # });
-    /// ```
-    pub fn drop_detector(&mut self) -> &mut Self {
-        self.tx = None;
-        self
+        (
+            PanicMonitor {
+                rx,
+                hooks: FuturesUnordered::new(),
+                rx_closed: false,
+            },
+            PanicDetector(tx),
+        )
     }
 }
 
@@ -490,7 +395,7 @@ impl<Info> Stream for PanicMonitor<Info>
 where
     Info: Unpin + Send + 'static,
 {
-    type Item = Result<(), Panicked<Info>>;
+    type Item = Panicked<Info>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         while !self.rx_closed {
@@ -508,8 +413,8 @@ where
             let res = Pin::new(&mut self.hooks).poll_next(cx);
             match res {
                 Poll::Ready(Some(r)) => {
-                    if r.is_err() {
-                        break Poll::Ready(Some(r));
+                    if r.is_some() {
+                        break Poll::Ready(r);
                     }
                 }
                 Poll::Ready(None) => {
@@ -537,8 +442,7 @@ mod tests {
 
     #[tokio::test]
     async fn alert_works() {
-        let alert = PanicAlert::new();
-        let detector = alert.new_detector();
+        let (alert, detector) = PanicAlert::new();
 
         for i in 0..=10 {
             tokio::spawn(
@@ -550,25 +454,24 @@ mod tests {
                 .on_panic(&detector),
             );
         }
-        assert!(alert.await.is_err());
+        assert!(alert.await.is_some());
 
-        let mut alert = PanicAlert::new();
+        let (alert, detector) = PanicAlert::new();
         (0..=10).for_each(|_| {
-            let detector = alert.new_detector();
-            tokio::spawn((move || async move {}.on_panic(&detector))());
+            tokio::spawn((|| async move {}.on_panic(&detector))());
         });
-        assert!(alert.drop_detector().await.is_ok());
+        drop(detector);
+        assert!(alert.await.is_none());
     }
 
     #[tokio::test]
     async fn unsend_works() {
-        let mut alert = PanicAlert::new();
+        let (alert, detector) = PanicAlert::new();
 
         let local = tokio::task::LocalSet::new();
         local
-            .run_until(async {
+            .run_until(async move {
                 {
-                    let detector = alert.new_detector();
                     let _ = tokio::task::spawn_local(
                         async move {
                             // panic!();
@@ -576,29 +479,35 @@ mod tests {
                         .unsend_on_panic(&detector),
                     );
                 }
-                assert!(alert.drop_detector().await.is_ok());
+                drop(detector);
+                assert!(alert.await.is_none());
             })
             .await;
     }
 
     #[tokio::test]
     async fn monitor_works() {
-        let mut monitor = PanicMonitor::new();
+        let (mut monitor, detector) = PanicMonitor::new();
 
         for i in 0..=10 {
+            let detector = detector.clone();
             tokio::spawn(
                 async move {
-                    if i % 5 == 0 {
+                    if i % 3 == 0 {
                         panic!();
                     }
                 }
-                .on_panic_info(&monitor.new_detector(), i),
+                .on_panic_info(&detector, i),
             );
         }
 
-        while let Some(res) = monitor.drop_detector().next().await {
-            let id = res.unwrap_err().0;
-            assert_eq!(id % 5, 0);
+        drop(detector);
+        let mut count = 0;
+        while let Some(res) = monitor.next().await {
+            let id = res.0;
+            assert_eq!(id % 3, 0);
+            count += 1;
         }
+        assert_eq!(count, 4);
     }
 }

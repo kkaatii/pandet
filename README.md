@@ -8,33 +8,34 @@ Useful when you are spawning lots of detached tasks but want to fast-fail if a p
 ```rust
 use pandet::{PanicAlert, OnPanic};
 
-let mut alert = PanicAlert::new();
+let (alert, detector) = PanicAlert::new();
 
 // Whichever async task spawner
 task::spawn(
     async move {
         panic!();
     }
-    .on_panic(&alert.new_detector()) // 👈 Binds the alert's detector
+    .on_panic(&detector()) // 👈 Binds the alert's detector
 );
 
-assert!(alert.drop_detector().await.is_err());
+drop(detector);
+assert!(alert.await.is_some());
 ```
 
 For `!Send` tasks, there is the `UnsendOnPanic` trait:
 ```rust
 use pandet::{PanicAlert, UnsendOnPanic};
 
-let mut alert = PanicAlert::new();
+let (alert, detector) = PanicAlert::new();
 
 task::spawn_local(
     async move {
         panic!();
     }
-    .unsend_on_panic(&alert.new_detector())
+    .unsend_on_panic(&detector)
 );
 
-assert!(alert.drop_detector().await.is_err());
+assert!(alert.await.is_some());
 ```
 
 Refined control over how to handle panics can also be implemented with `PanicMonitor`
@@ -49,24 +50,26 @@ struct PanicInfo {
     task_id: usize,
 }
 
-let mut monitor = PanicMonitor::<PanicInfo>::new(); // Or simply PanicMonitor::new()
-{
-    let detector = monitor.new_detector();
-    for task_id in 0..=10 {
-        task::spawn(
-            async move {
-                if task_id % 3 == 0 {
-                    panic!();
-                }
+let (mut monitor, detector) = PanicMonitor::<PanicInfo>::new(); // Or simply PanicMonitor::new()
+for task_id in 0..=10 {
+    let detector = detector.clone();
+    task::spawn(
+        async move {
+            if task_id % 3 == 0 {
+                panic!();
             }
-            // Informs the monitor of which task panicked
-            .on_panic_info(&detector, PanicInfo { task_id })
-        );
-    }
-} // detector goes out of scope, allowing the monitor to finish after calling drop_detector()
+        }
+        // Informs the monitor of which task panicked
+        .on_panic_info(&detector, PanicInfo { task_id })
+    );
+}
 
-while let Some(res) = monitor.drop_detector().next().await {
-    let info = res.unwrap_err().0;
+drop(detector);
+let cnt = 0;
+while let Some(res) = monitor.next().await {
+    cnt += 1;
+    let info = res.0;
     assert_eq!(info.task_id % 3, 0);
 }
+assert_eq!(cnt, 4);
 ```
