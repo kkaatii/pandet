@@ -1,3 +1,7 @@
+# Version 0.4.0
+
+- Rewrite key APIs (again) to improve ergonomics. There is no need to manually drop detectors now.
+
 # Version 0.3.0
 
 - Rewrite key APIs to improve ergonomics.

@@ -6,70 +6,66 @@ A lightweight library that helps you detect failure of spawned async tasks witho
 Useful when you are spawning lots of detached tasks but want to fast-fail if a panic occurs.
 
 ```rust
-use pandet::{PanicAlert, OnPanic};
+use pandet::*;
 
-let (alert, detector) = PanicAlert::new();
+let detector = PanicDetector::new();
 
 // Whichever async task spawner
 task::spawn(
     async move {
         panic!();
     }
-    .on_panic(&detector()) // 👈 Binds the alert's detector
+    .alert(&detector) // 👈 Binds the detector so it is notified of any panic from the future
 );
 
-drop(detector);
-assert!(alert.await.is_some());
+assert!(detector.await.is_some());
 ```
 
-For `!Send` tasks, there is the `UnsendOnPanic` trait:
+`!Send` tasks implement the `LocalAlert` trait:
 ```rust
-use pandet::{PanicAlert, UnsendOnPanic};
+use pandet::*;
 
-let (alert, detector) = PanicAlert::new();
+let detector = PanicDetector::new();
 
 task::spawn_local(
     async move {
-        panic!();
+        // Does some work without panicking...
     }
-    .unsend_on_panic(&detector)
+    .local_alert(&detector)
 );
 
-assert!(alert.await.is_some());
+assert!(detector.await.is_none());
 ```
 
 Refined control over how to handle panics can also be implemented with `PanicMonitor`
-which works like a stream of alerts. You may also pass some information to the alert/monitor
+which works like a stream of alerts. You may also pass some message to the detector/monitor
 when a panic occurs:
 ```rust
 use futures::StreamExt;
-use pandet::{PanicMonitor, OnPanic};
+use pandet::*;
 
 // Any Unpin + Send + 'static type works
-struct PanicInfo {
+struct FailureMsg {
     task_id: usize,
 }
 
-let (mut monitor, detector) = PanicMonitor::<PanicInfo>::new(); // Or simply PanicMonitor::new()
+let mut monitor = PanicMonitor::<FailureMsg>::new(); // Or simply PanicMonitor::new()
 for task_id in 0..=10 {
-    let detector = detector.clone();
     task::spawn(
         async move {
             if task_id % 3 == 0 {
                 panic!();
             }
         }
-        // Informs the monitor of which task panicked
-        .on_panic_info(&detector, PanicInfo { task_id })
+        // Notifies the monitor of the panicked task's ID
+        .alert_msg(&monitor, FailureMsg { task_id })
     );
 }
 
-drop(detector);
 let cnt = 0;
-while let Some(res) = monitor.next().await {
+while let Some(Panicked(msg)) = monitor.next().await {
     cnt += 1;
-    let info = res.0;
-    assert_eq!(info.task_id % 3, 0);
+    assert_eq!(msg.task_id % 3, 0);
 }
 assert_eq!(cnt, 4);
 ```

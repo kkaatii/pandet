@@ -6,43 +6,41 @@
 //! # use tokio as task;
 //! # #[task::main]
 //! # async fn main() {
-//! use pandet::{PanicAlert, OnPanic};
+//! use pandet::*;
 //!
-//! let (alert, detector) = PanicAlert::new();
+//! let detector = PanicDetector::new();
 //!
 //! // Whichever async task spawner
 //! task::spawn(
 //!     async move {
 //!         panic!();
 //!     }
-//!     .on_panic(&detector) // 👈 Binds the alert's detector
+//!     .alert(&detector) // 👈 Binds the detector so it is notified of any panic from the future
 //! );
 //!
-//! drop(detector);
-//! assert!(alert.await.is_some()); // See notes below
+//! assert!(detector.await.is_some()); // See notes below
 //! # }
 //! ```
 //!
-//! For `!Send` tasks, there is the [`UnsendOnPanic`] trait:
+//! `!Send` tasks implement the [`LocalAlert`] trait:
 //! ```rust
 //! # use tokio::{runtime, task};
 //! # fn main() {
-//! use pandet::{PanicAlert, UnsendOnPanic};
+//! use pandet::*;
 //!
-//! let (alert, detector) = PanicAlert::new();
+//! let detector = PanicDetector::new();
 //!
 //! # let local = task::LocalSet::new();
 //! # let rt = runtime::Runtime::new().unwrap();
 //! # local.block_on(&rt, async {
 //! task::spawn_local(
 //!     async move {
-//!         panic!();
+//!         // Does some work without panicking...
 //!     }
-//!     .unsend_on_panic(&detector)
+//!     .local_alert(&detector)
 //! );
 //!
-//! drop(detector);
-//! assert!(alert.await.is_some());
+//! assert!(detector.await.is_none());
 //! # }); }
 //! ```
 //!
@@ -54,14 +52,14 @@
 //! # #[task::main]
 //! # async fn main() {
 //! use futures::StreamExt;
-//! use pandet::{PanicMonitor, OnPanic};
+//! use pandet::*;
 //!
 //! // Any Unpin + Send + 'static type works
-//! struct PanicInfo {
+//! struct FailureMsg {
 //!     task_id: usize,
 //! }
 //!
-//! let (mut monitor, detector) = PanicMonitor::<PanicInfo>::new(); // Or simply PanicMonitor::new()
+//! let mut monitor = PanicMonitor::<FailureMsg>::new(); // Or simply PanicMonitor::new()
 //! for task_id in 0..=10 {
 //!     task::spawn(
 //!         async move {
@@ -69,15 +67,13 @@
 //!                 panic!();
 //!             }
 //!         }
-//!         // Informs the monitor of which task panicked
-//!         .on_panic_info(&detector, PanicInfo { task_id })
+//!         // Notifies the monitor of the panicked task's ID
+//!         .alert_msg(&monitor, FailureMsg { task_id })
 //!     );
 //! }
 //!
-//! drop(detector);
-//! while let Some(res) = monitor.next().await {
-//!     let info = res.0;
-//!     assert_eq!(info.task_id % 3, 0);
+//! while let Some(Panicked(msg)) = monitor.next().await {
+//!     assert_eq!(msg.task_id % 3, 0);
 //! }
 //! # }
 //! ```
@@ -101,66 +97,65 @@ use futures::{
 ///
 /// Its first and only field is the additional information emitted when the corresponding task panics.
 /// The field defaults to `()`.
-pub struct Panicked<Info = ()>(pub Info)
+pub struct Panicked<Msg = ()>(pub Msg)
 where
-    Info: Send + 'static;
+    Msg: Send + 'static;
 
-/// Notifies [`PanicAlert`]/[`PanicMonitor`] of panics.
+/// Notifies [`PanicDetector`]/[`PanicMonitor`] of panics.
 ///
-/// Can be bounded to [`OnPanic`] and [`UnsendOnPanic`] types.
-pub struct PanicDetector<Info = ()>(UnboundedSender<PanicHook<Info>>)
+/// Can be bounded to [`Alert`] and [`LocalAlert`] types.
+pub struct DetectorHook<Msg = ()>(UnboundedSender<RxHandle<Msg>>)
 where
-    Info: Send + 'static;
+    Msg: Send + 'static;
 
-impl<Info> Clone for PanicDetector<Info>
+impl<Msg> Clone for DetectorHook<Msg>
 where
-    Info: Send + 'static,
+    Msg: Send + 'static,
 {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
 }
 
-/// Used to bind a `PanicDetector` onto any task. Implemented for all `Future` types.
-pub trait UnsendOnPanic<'a, T> {
+/// Used to bind a [`PanicDetector`] onto any task. Implemented for all `Future` types.
+pub trait LocalAlert<'a, T> {
     /// Consumes a task, and returns a new task with the `PanicDetector` bound to it.
-    fn unsend_on_panic(self, detector: &PanicDetector) -> UnsendPanicAwareFuture<'a, T>;
+    fn local_alert<A>(self, hook: &'_ A) -> LocalPanicAwareFuture<'a, T>
+    where
+        A: AsRef<DetectorHook>;
 
     /// Binds a `PanicDetector` and emits additional information when the panic is detected.
-    fn unsend_on_panic_info<Info>(
-        self,
-        detector: &PanicDetector<Info>,
-        info: Info,
-    ) -> UnsendPanicAwareFuture<'a, T>
+    fn local_alert_msg<Msg, A>(self, hook: &'_ A, msg: Msg) -> LocalPanicAwareFuture<'a, T>
     where
-        Info: Send + 'static;
+        Msg: Send + 'static,
+        A: AsRef<DetectorHook<Msg>>;
 }
 
-impl<'a, F> UnsendOnPanic<'a, F::Output> for F
+impl<'a, F> LocalAlert<'a, F::Output> for F
 where
     F: Future + 'a,
 {
-    fn unsend_on_panic(self, detector: &PanicDetector) -> UnsendPanicAwareFuture<'a, F::Output> {
-        self.unsend_on_panic_info(detector, ())
+    fn local_alert<A>(self, hook: &'_ A) -> LocalPanicAwareFuture<'a, F::Output>
+    where
+        A: AsRef<DetectorHook>,
+    {
+        self.local_alert_msg(hook, ())
     }
 
-    fn unsend_on_panic_info<Info>(
-        self,
-        detector: &PanicDetector<Info>,
-        info: Info,
-    ) -> UnsendPanicAwareFuture<'a, F::Output>
+    fn local_alert_msg<Msg, A>(self, hook: &'_ A, msg: Msg) -> LocalPanicAwareFuture<'a, F::Output>
     where
-        Info: Send + 'static,
+        Msg: Send + 'static,
+        A: AsRef<DetectorHook<Msg>>,
     {
         let (tx, rx) = oneshot::channel();
-        detector
+        hook.as_ref()
             .0
-            .unbounded_send(PanicHook {
+            .unbounded_send(RxHandle {
                 signaler: rx,
-                info: Some(info),
+                msg: Some(msg),
             })
-            .expect("panic alert/monitor dropped early");
-        UnsendPanicAwareFuture::new(async move {
+            .expect("detector dropped early");
+        LocalPanicAwareFuture::new(async move {
             let ret = self.await;
             let _ = tx.send(());
             ret
@@ -169,22 +164,22 @@ where
 }
 
 #[doc(hidden)]
-pub struct UnsendPanicAwareFuture<'a, T> {
+pub struct LocalPanicAwareFuture<'a, T> {
     inner: Pin<Box<dyn Future<Output = T> + 'a>>,
 }
 
-impl<'a, T> UnsendPanicAwareFuture<'a, T> {
+impl<'a, T> LocalPanicAwareFuture<'a, T> {
     fn new<Fut>(fut: Fut) -> Self
     where
         Fut: Future<Output = T> + 'a,
     {
-        UnsendPanicAwareFuture {
+        LocalPanicAwareFuture {
             inner: Box::pin(fut),
         }
     }
 }
 
-impl<T> Future for UnsendPanicAwareFuture<'_, T> {
+impl<T> Future for LocalPanicAwareFuture<'_, T> {
     type Output = T;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -192,46 +187,45 @@ impl<T> Future for UnsendPanicAwareFuture<'_, T> {
     }
 }
 
-/// Used to bind a `PanicDetector` onto a `Send` task. Implemented for all types that are
+/// Used to bind a [`PanicDetector`] onto a `Send` task. Implemented for all types that are
 /// `Future + Send`.
-pub trait OnPanic<'a, T> {
+pub trait Alert<'a, T> {
     /// Consumes a task, and returns a new task with the `PanicDetector` bound to it.
-    fn on_panic(self, detector: &PanicDetector) -> PanicAwareFuture<'a, T>;
+    fn alert<A>(self, hook: &'_ A) -> PanicAwareFuture<'a, T>
+    where
+        A: AsRef<DetectorHook>;
 
     /// Binds a `PanicDetector` and emits additional information when the panic is detected.
-    fn on_panic_info<Info>(
-        self,
-        detector: &PanicDetector<Info>,
-        info: Info,
-    ) -> PanicAwareFuture<'a, T>
+    fn alert_msg<Msg, A>(self, hook: &'_ A, msg: Msg) -> PanicAwareFuture<'a, T>
     where
-        Info: Send + 'static;
+        Msg: Send + 'static,
+        A: AsRef<DetectorHook<Msg>>;
 }
 
-impl<'a, F> OnPanic<'a, F::Output> for F
+impl<'a, F> Alert<'a, F::Output> for F
 where
     F: Future + Send + 'a,
 {
-    fn on_panic(self, detector: &PanicDetector) -> PanicAwareFuture<'a, F::Output> {
-        self.on_panic_info(detector, ())
+    fn alert<A>(self, hook: &'_ A) -> PanicAwareFuture<'a, F::Output>
+    where
+        A: AsRef<DetectorHook>,
+    {
+        self.alert_msg(hook, ())
     }
 
-    fn on_panic_info<Info>(
-        self,
-        detector: &PanicDetector<Info>,
-        info: Info,
-    ) -> PanicAwareFuture<'a, F::Output>
+    fn alert_msg<Msg, A>(self, hook: &'_ A, msg: Msg) -> PanicAwareFuture<'a, F::Output>
     where
-        Info: Send + 'static,
+        Msg: Send + 'static,
+        A: AsRef<DetectorHook<Msg>>,
     {
         let (tx, rx) = oneshot::channel();
-        detector
+        hook.as_ref()
             .0
-            .unbounded_send(PanicHook {
+            .unbounded_send(RxHandle {
                 signaler: rx,
-                info: Some(info),
+                msg: Some(msg),
             })
-            .expect("panic alert/monitor dropped early");
+            .expect("detector dropped early");
         PanicAwareFuture::new(async move {
             let ret = self.await;
             let _ = tx.send(());
@@ -264,27 +258,25 @@ impl<T> Future for PanicAwareFuture<'_, T> {
     }
 }
 
-struct PanicHook<Info>
+struct RxHandle<Msg>
 where
-    Info: Send + 'static,
+    Msg: Send + 'static,
 {
     signaler: oneshot::Receiver<()>,
-    info: Option<Info>,
+    msg: Option<Msg>,
 }
 
-impl<Info> Future for PanicHook<Info>
+impl<Msg> Future for RxHandle<Msg>
 where
-    Info: Unpin + Send + 'static,
+    Msg: Unpin + Send + 'static,
 {
-    type Output = Option<Panicked<Info>>;
+    type Output = Option<Panicked<Msg>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
         let res = self.signaler.poll_unpin(cx);
         res.map(|r| {
             if r.is_err() {
-                Some(Panicked(
-                    self.info.take().expect("panic info already emitted"),
-                ))
+                Some(Panicked(self.msg.take().expect("message already read")))
             } else {
                 None
             }
@@ -292,41 +284,55 @@ where
     }
 }
 
-/// A future that finishes with an `Some(Panicked<Info>)` when a task has panicked or `None` if no task panicked.
-pub struct PanicAlert<Info = ()>
+/// A future that finishes with an `Some(Panicked<Msg>)` when a task has panicked or `None` if no task panicked.
+pub struct PanicDetector<Msg = ()>
 where
-    Info: Send + 'static,
+    Msg: Send + 'static,
 {
-    rx: UnboundedReceiver<PanicHook<Info>>,
-    hooks: FuturesUnordered<PanicHook<Info>>,
+    detector: Option<DetectorHook<Msg>>,
+    rx: UnboundedReceiver<RxHandle<Msg>>,
+    hooks: FuturesUnordered<RxHandle<Msg>>,
     rx_closed: bool,
 }
 
-impl<Info> PanicAlert<Info>
+impl<Msg> PanicDetector<Msg>
 where
-    Info: Send + 'static,
+    Msg: Send + 'static,
 {
     /// Creates a new `PanicMonitor`.
-    pub fn new() -> (Self, PanicDetector<Info>) {
+    pub fn new() -> Self {
         let (tx, rx) = unbounded();
-        (
-            PanicAlert {
-                rx,
-                hooks: FuturesUnordered::new(),
-                rx_closed: false,
-            },
-            PanicDetector(tx),
-        )
+        PanicDetector {
+            detector: Some(DetectorHook(tx)),
+            rx,
+            hooks: FuturesUnordered::new(),
+            rx_closed: false,
+        }
     }
 }
 
-impl<Info> Future for PanicAlert<Info>
+impl<Msg> AsRef<DetectorHook<Msg>> for PanicDetector<Msg>
 where
-    Info: Unpin + Send + 'static,
+    Msg: Unpin + Send + 'static,
 {
-    type Output = Option<Panicked<Info>>;
+    fn as_ref(&self) -> &DetectorHook<Msg> {
+        match self.detector {
+            Some(ref det) => det,
+            None => panic!(
+                "This detector has been polled. Create a new detector to receive new panic alerts."
+            ),
+        }
+    }
+}
+
+impl<Msg> Future for PanicDetector<Msg>
+where
+    Msg: Unpin + Send + 'static,
+{
+    type Output = Option<Panicked<Msg>>;
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        self.detector = None;
         while !self.rx_closed {
             match Pin::new(&mut self.rx).poll_next(cx) {
                 Poll::Pending => break,
@@ -362,42 +368,56 @@ where
 }
 
 /// A [`Stream`](https://docs.rs/futures/latest/futures/stream/trait.Stream.html#) of detected panics.
-/// 
+///
 /// It finishes when all the futures that it's detecting for have finished.
-pub struct PanicMonitor<Info = ()>
+pub struct PanicMonitor<Msg = ()>
 where
-    Info: Send + 'static,
+    Msg: Send + 'static,
 {
-    rx: UnboundedReceiver<PanicHook<Info>>,
-    hooks: FuturesUnordered<PanicHook<Info>>,
+    detector: Option<DetectorHook<Msg>>,
+    rx: UnboundedReceiver<RxHandle<Msg>>,
+    hooks: FuturesUnordered<RxHandle<Msg>>,
     rx_closed: bool,
 }
 
-impl<Info> PanicMonitor<Info>
+impl<Msg> PanicMonitor<Msg>
 where
-    Info: Send + 'static,
+    Msg: Send + 'static,
 {
     /// Creates a new `PanicMonitor`.
-    pub fn new() -> (Self, PanicDetector<Info>) {
+    pub fn new() -> Self {
         let (tx, rx) = unbounded();
-        (
-            PanicMonitor {
-                rx,
-                hooks: FuturesUnordered::new(),
-                rx_closed: false,
-            },
-            PanicDetector(tx),
-        )
+        PanicMonitor {
+            detector: Some(DetectorHook(tx)),
+            rx,
+            hooks: FuturesUnordered::new(),
+            rx_closed: false,
+        }
     }
 }
 
-impl<Info> Stream for PanicMonitor<Info>
+impl<Msg> AsRef<DetectorHook<Msg>> for PanicMonitor<Msg>
 where
-    Info: Unpin + Send + 'static,
+    Msg: Unpin + Send + 'static,
 {
-    type Item = Panicked<Info>;
+    fn as_ref(&self) -> &DetectorHook<Msg> {
+        match self.detector {
+            Some(ref det) => det,
+            None => panic!(
+                "This monitor has been polled. Create a new monitor to receive new panic alerts."
+            ),
+        }
+    }
+}
+
+impl<Msg> Stream for PanicMonitor<Msg>
+where
+    Msg: Unpin + Send + 'static,
+{
+    type Item = Panicked<Msg>;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        self.detector = None;
         while !self.rx_closed {
             match Pin::new(&mut self.rx).poll_next(cx) {
                 Poll::Pending => break,
@@ -432,7 +452,7 @@ where
     }
 }
 
-impl<Info: Unpin + Send + 'static> Unpin for PanicMonitor<Info> {}
+impl<Msg: Unpin + Send + 'static> Unpin for PanicMonitor<Msg> {}
 
 #[cfg(test)]
 mod tests {
@@ -442,7 +462,7 @@ mod tests {
 
     #[tokio::test]
     async fn alert_works() {
-        let (alert, detector) = PanicAlert::new();
+        let detector = PanicDetector::new();
 
         for i in 0..=10 {
             tokio::spawn(
@@ -451,22 +471,21 @@ mod tests {
                         panic!("What could go wrong");
                     }
                 }
-                .on_panic(&detector),
+                .alert(&detector),
             );
         }
-        assert!(alert.await.is_some());
+        assert!(detector.await.is_some());
 
-        let (alert, detector) = PanicAlert::new();
+        let detector = PanicDetector::new();
         (0..=10).for_each(|_| {
-            tokio::spawn((|| async move {}.on_panic(&detector))());
+            tokio::spawn((|| async move {}.alert(&detector))());
         });
-        drop(detector);
-        assert!(alert.await.is_none());
+        assert!(detector.await.is_none());
     }
 
     #[tokio::test]
     async fn unsend_works() {
-        let (alert, detector) = PanicAlert::new();
+        let detector = PanicDetector::new();
 
         let local = tokio::task::LocalSet::new();
         local
@@ -476,32 +495,29 @@ mod tests {
                         async move {
                             // panic!();
                         }
-                        .unsend_on_panic(&detector),
+                        .local_alert(&detector),
                     );
                 }
-                drop(detector);
-                assert!(alert.await.is_none());
+                assert!(detector.await.is_none());
             })
             .await;
     }
 
     #[tokio::test]
     async fn monitor_works() {
-        let (mut monitor, detector) = PanicMonitor::new();
+        let mut monitor = PanicMonitor::new();
 
         for i in 0..=10 {
-            let detector = detector.clone();
             tokio::spawn(
                 async move {
                     if i % 3 == 0 {
                         panic!();
                     }
                 }
-                .on_panic_info(&detector, i),
+                .alert_msg(&monitor, i),
             );
         }
 
-        drop(detector);
         let mut count = 0;
         while let Some(res) = monitor.next().await {
             let id = res.0;
